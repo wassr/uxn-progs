@@ -1,0 +1,125 @@
+( SELF.TAL -- UXN )
+( COPYRIGHT NOEL ATZWANGER @WASSR )
+
+|08 @System/r $2 @System/g $2 @System/b $2
+|18 @Console/write $1
+|22 @Screen/width $2 @Screen/height $2 @Screen/auto $1
+|28 @Screen/x $2 @Screen/y $2 @Screen/addr $2 $1 @Screen/sprite $1
+
+|0000
+@cursor $1 &low $1
+
+|0100 @rom-start
+    #1fff .System/r DEO2
+    #2fff .System/g DEO2
+    #3fff .System/b DEO2
+
+    ( 39 columns, three header rows, and an 8-pixel margin. )
+    #0148 .Screen/width DEO2
+    ;rom-end ;rom-start SUB2 #000f ADD2 #04 SFT2
+    #0005 ADD2 #30 SFT2 .Screen/height DEO2
+    #0008 .Screen/x DEO2
+    #0008 .Screen/y DEO2
+    #01 .Screen/auto DEO
+    ;heading ;emit-string JSR2
+
+    ;rom-start .cursor STZ2
+    &word
+        ;emit-byte JSR2
+        ;emit-byte JSR2
+        .cursor LDZ2 ;rom-end EQU2 ,&done JCN
+        .cursor/low LDZ #0f AND ,&space JCN
+        #0a ;emit JSR2
+        ,&word JMP
+    &space
+        #20 ;emit JSR2
+        ,&word JMP
+    &done
+        #0a ;emit JSR2
+BRK
+
+@emit-string ( address* -- )
+    &loop
+        LDAk DUP ,&character JCN
+        POP POP2 JMP2r
+    &character
+        ;emit JSR2 INC2 ,&loop JMP
+
+@emit-byte ( -- )
+    .cursor LDZ2 LDA
+    .cursor LDZ2 INC2 .cursor STZ2
+    DUP #04 SFT ;emit-digit JSR2
+    #0f AND
+@emit-digit ( nibble -- )
+    #00 SWP ;glyphs ADD2 LDA
+
+@emit ( character -- )
+    DUP ;emit-console JSR2
+    DUP #0a EQU ,&newline JCN
+    DUP #20 EQU ,&blank JCN
+    STH ;glyphs
+    &find
+        LDAk STHkr EQU ,&draw JCN
+        INC2 DUP2 ;glyphs-end NEQ2 ,&find JCN
+        POP2 POPr ,&advance JMP
+    &draw
+        POPr
+        ;glyphs SUB2 #30 SFT2 ;font ADD2 .Screen/addr DEO2
+        #01 .Screen/sprite DEO
+        JMP2r
+    &blank
+        POP
+    &advance
+        .Screen/x DEI2 #0008 ADD2 .Screen/x DEO2
+        JMP2r
+    &newline
+        POP
+        #0008 .Screen/x DEO2
+        .Screen/y DEI2 #0008 ADD2 .Screen/y DEO2
+        JMP2r
+
+@emit-console ( character -- )
+    ( Set the ASCII lowercase bit on console letters. )
+    DUP #41 SUB #1a LTH #50 SFT ORA .Console/write DEO
+    JMP2r
+
+@heading
+    2020 2020 2020 2020 2020 ( 10 spaces )
+    2820 "SELF.TAL 20 "-- 20 "UXN 2029 0a
+    2020 ( 2 spaces )
+    2820 "COPYRIGHT 20 "NOEL 20 "ATZWANGER 20 "@WASSR 2029 0a
+    2020 2020 2020 2020 2020 2020 2020 2020 20 ( 17 spaces )
+    "|0100 0a00
+
+( Glyph order from chars.txt, followed by the missing heading and origin glyphs. )
+@glyphs "0123456789ABCDEFUXN-SLT.#OWRZG()@HIPY|
+@glyphs-end
+
+( The 32 populated 8x8 tiles from chars.chr, in glyph order. )
+@font
+    003c 464a 5262 3c00 0018 0808 0808 0800
+    007c 023c 4040 7e00 007c 027e 0202 7c00
+    0004 0810 247e 0400 007e 407c 0202 7c00
+    003c 407c 4242 3c00 007e 0408 1020 4000
+    003c 423c 4242 3c00 003c 423e 0202 3c00
+    003c 427e 4242 4200 007c 427c 4242 7c00
+    003e 4040 4040 3e00 007c 4242 4242 7c00
+    003e 407e 4040 3e00 007e 407c 4040 4000
+    0042 4242 4242 3c00 0042 2418 1824 4200
+    0042 6252 4a46 4200 0000 0018 1800 0000
+    003e 403c 0202 7c00 0040 4040 4040 7e00
+    007e 0808 0808 0800 0000 0000 0018 1800
+    0024 7e24 247e 2400 003c 4242 4242 3c00
+    0042 4242 5252 2c00 007c 427c 4844 4200
+    007e 0408 1020 7e00 003e 405e 4242 3e00
+    000c 1020 2010 0c00 0030 0804 0408 3000
+    003c 425a 5e40 3c00 ( @ )
+    0042 427e 4242 4200 ( H )
+    003e 0808 0808 3e00 ( I )
+    007c 427c 4040 4000 ( P )
+    0042 2418 0808 0800 ( Y )
+    0008 0808 0808 0800 ( | )
+
+( Pad to |03d0, the next 16-byte boundary. )
+|03cf 00
+@rom-end
