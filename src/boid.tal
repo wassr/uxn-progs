@@ -1,0 +1,330 @@
+( BOID.TAL -- A 2D flock on a wrapping 512 by 512 screen )
+
+%GET { ADD2 LDA2 }
+%PUT { ADD2 STA2 }
+
+|08 @System/r $2 &g $2 &b $2
+|20 @Screen/vector $2 &width $2 &height $2
+|28 @Screen/x $2 &y $2 &addr $2 &pixel $1 &sprite $1
+
+|0000
+@seed $2
+@boid $2
+@other $2
+@cell-x $1
+@cell-y $1
+@column $1
+@row $1
+@dx $2
+@dy $2
+@neighbors $2
+@close $2
+@cohesion $2 &y $2
+@alignment $2 &y $2
+@separation $2 &y $2
+@heading $1 &x $2 &y $2
+@sprite-x $2 &y $2
+@trail-slot $1 &clock $1 &length $1
+
+|0100 @on-reset ( -- )
+    ( Midnight, wake, wing, and highlight. )
+    #126f .System/r DEO2
+    #25ce .System/g DEO2
+    #37bc .System/b DEO2
+    #0200 .Screen/width DEO2
+    #0200 .Screen/height DEO2
+    #9e37 .seed STZ2
+    ;flock .boid STZ2
+    &loop
+        random .boid LDZ2 STA2
+        random .boid LDZ2 #0002 PUT
+        random #0007 AND2 #20 SFT2 ;initial-velocities ADD2
+        LDA2k .boid LDZ2 #0004 PUT
+        #0002 GET .boid LDZ2 #0006 PUT
+        next-boid ?&loop
+    draw-flock
+    ;on-frame .Screen/vector DEO2
+    BRK
+
+@on-frame ( -- )
+    steer-flock
+    move-flock
+    sample-trails
+    draw-flock
+    BRK
+
+@steer-flock ( -- )
+    ( Calculate all new velocities before changing positions or velocities. )
+    index-flock
+    ;flock .boid STZ2
+    &loop
+        find-neighbors
+        #00 steer-axis .boid LDZ2 #0008 PUT
+        #02 steer-axis .boid LDZ2 #000a PUT
+        keep-moving
+        next-boid ?&loop
+    JMP2r
+
+@index-flock ( -- )
+    ( Rebuild the 8 by 8 grid of linked lists from the current positions. )
+    ;grid
+    &clear
+        #0000 OVR2 STA2
+        INC2 INC2 DUP2 ;flock LTH2 ?&clear
+    POP2
+    ;flock .boid STZ2
+    &add
+        boid-cell bucket
+        LDA2k .boid LDZ2 #000c PUT
+        .boid LDZ2 SWP2 STA2
+        next-boid ?&add
+    JMP2r
+
+@boid-cell ( -- x y )
+    ( A cell spans 32 units in 8.8 coordinates, or 64 display pixels. )
+    .boid LDZ2 LDA2 #0d SFT2 NIP
+    .boid LDZ2 #0002 GET #0d SFT2 NIP
+    JMP2r
+
+@bucket ( x y -- address* )
+    #07 AND #40 SFT SWP #07 AND #10 SFT ORA
+    #00 SWP ;grid ADD2 JMP2r
+
+@find-neighbors ( -- )
+    #0000
+    DUP2 .neighbors STZ2 DUP2 .close STZ2
+    DUP2 .cohesion STZ2 DUP2 .cohesion/y STZ2
+    DUP2 .alignment STZ2 DUP2 .alignment/y STZ2
+    DUP2 .separation STZ2 .separation/y STZ2
+    ( The vision radius is smaller than a cell. Scan only the nine adjacent cells. )
+    boid-cell #01 SUB .cell-y STZ #01 SUB .cell-x STZ
+    #00 .row STZ
+    &scan-row
+        #00 .column STZ
+    &scan-cell
+        .cell-x LDZ .column LDZ ADD .cell-y LDZ .row LDZ ADD bucket LDA2
+    &visit
+        DUP2 ORA ?&candidate
+        POP2
+        .column LDZ INC DUP .column STZ #03 LTH ?&scan-cell
+        .row LDZ INC DUP .row STZ #03 LTH ?&scan-row
+        JMP2r
+    &candidate
+        DUP2 .other STZ2 .boid LDZ2 EQU2 ?&next
+        consider-neighbor
+    &next
+        .other LDZ2 #000c GET !&visit
+
+@consider-neighbor ( -- )
+    ( Wrapped subtraction gives the shortest signed offset in 8.8. )
+    .other LDZ2 LDA2 .boid LDZ2 LDA2 SUB2 whole-units .dx STZ2
+    .other LDZ2 #0002 GET .boid LDZ2 #0002 GET SUB2 whole-units .dy STZ2
+    .dx LDZ2 abs16 .dy LDZ2 abs16 ADD2
+    DUP2 #001c LTH2 ?&near
+    POP2 JMP2r
+    &near
+        .neighbors LDZ2 INC2 .neighbors STZ2
+        .dx LDZ2 .cohesion LDZ2 ADD2 .cohesion STZ2
+        .dy LDZ2 .cohesion/y LDZ2 ADD2 .cohesion/y STZ2
+        ( Scale velocity differences early so even a full cell fits in 16 bits. )
+        .other LDZ2 #0004 GET .boid LDZ2 #0004 GET SUB2 #0008 signed-div
+        .alignment LDZ2 ADD2 .alignment STZ2
+        .other LDZ2 #0006 GET .boid LDZ2 #0006 GET SUB2 #0008 signed-div
+        .alignment/y LDZ2 ADD2 .alignment/y STZ2
+        #000a LTH2 ?&too-close
+        JMP2r
+    &too-close
+        .close LDZ2 INC2 .close STZ2
+        .separation LDZ2 .dx LDZ2 SUB2 .separation STZ2
+        .separation/y LDZ2 .dy LDZ2 SUB2 .separation/y STZ2
+    JMP2r
+
+@steer-axis ( axis-offset -- velocity* )
+    STH
+    .boid LDZ2 #00 STHkr #0004 ADD2 GET
+    .neighbors LDZ2 ORA ?&steer
+    POPr JMP2r
+    &steer
+        ( Pull toward the neighbors' center and match their velocity. )
+        .cohesion STHkr ADD LDZ2 #20 SFT2 .neighbors LDZ2 signed-div
+        .alignment STHkr ADD LDZ2 .neighbors LDZ2 signed-div ADD2
+        ( Use a smaller neighborhood for repulsion. )
+        .close LDZ2 ORA ?&repel
+        !&limit
+    &repel
+        .separation STHkr ADD LDZ2 #40 SFT2 .close LDZ2 signed-div #10 SFT2 ADD2
+    &limit
+        ( Limit acceleration and speed per axis in 8.8 units. )
+        #0050 limit-magnitude ADD2 #0180 limit-magnitude
+        POPr JMP2r
+
+@keep-moving ( -- )
+    ( If both components are slow, raise the larger one to half a pixel. )
+    .boid LDZ2 #0008 GET abs16
+    .boid LDZ2 #000a GET abs16
+    GTH2 ?&x
+    #000a !&check
+    &x #0008
+    &check
+        .boid LDZ2 ADD2 STH2
+        STH2kr LDA2 DUP2 abs16 #0080 LTH2 ?&nudge
+        POP2 POP2r JMP2r
+    &nudge
+        #8000 LTH2 ?&positive
+        #ff80 !&store
+    &positive #0080
+    &store
+        STH2r STA2 JMP2r
+
+@move-flock ( -- )
+    ;flock .boid STZ2
+    &loop
+        .boid LDZ2 #0008 GET DUP2 .boid LDZ2 #0004 PUT
+        .boid LDZ2 LDA2 ADD2 .boid LDZ2 STA2
+        .boid LDZ2 #000a GET DUP2 .boid LDZ2 #0006 PUT
+        .boid LDZ2 #0002 GET ADD2 .boid LDZ2 #0002 PUT
+        next-boid ?&loop
+    JMP2r
+
+@draw-flock ( -- )
+    #0000 .Screen/x DEO2
+    #0000 .Screen/y DEO2
+    #c0 .Screen/pixel DEO
+    .trail-slot/length LDZ #00 EQU ?&sprites
+    draw-trails
+    &sprites
+    ;flock .boid STZ2
+    &loop
+        .boid LDZ2 LDA2 #07 SFT2 #0004 SUB2 .sprite-x STZ2
+        .boid LDZ2 #0002 GET #07 SFT2 #0004 SUB2 .sprite-x/y STZ2
+        draw-boid
+        next-boid ?&loop
+    JMP2r
+
+@sample-trails ( -- )
+    ( Keep four positions per boid, sampled every third frame. )
+    .trail-slot/clock LDZ INC DUP .trail-slot/clock STZ #03 LTH ?&done
+    #00 .trail-slot/clock STZ
+    .trail-slot/length LDZ #10 LTH ?&grow
+    !&save
+    &grow
+        .trail-slot/length LDZ #04 ADD .trail-slot/length STZ
+    &save
+        ;flock .boid STZ2
+    &loop
+        .boid LDZ2 DUP2 #00 .trail-slot LDZ #0010 ADD2 ADD2 STH2
+        LDA2k STH2kr STA2
+        #0002 GET STH2r INC2 INC2 STA2
+        next-boid ?&loop
+    .trail-slot LDZ #04 ADD #0f AND .trail-slot STZ
+    &done JMP2r
+
+@draw-trails ( -- )
+    ;flock .boid STZ2
+    &boid
+        .boid LDZ2 #0010 ADD2 .trail-slot/length LDZ
+    &sample
+        STH
+        LDA2k #07 SFT2 .Screen/x DEO2
+        INC2 INC2 LDA2k #07 SFT2 .Screen/y DEO2
+        #41 .Screen/pixel DEO
+        INC2 INC2 STHr #04 SUB DUP ?&sample
+        POP POP2
+        next-boid ?&boid
+    JMP2r
+
+@draw-boid ( -- )
+    ( The base sprites face east, north, and northeast. )
+    #c5 .heading STZ
+    .boid LDZ2 #0004 GET DUP2 abs16 .heading/x STZ2
+    #8000 LTH2 ?&check-y
+    .heading LDZ #10 ORA .heading STZ
+    &check-y
+        .boid LDZ2 #0006 GET DUP2 abs16 .heading/y STZ2
+        #8000 LTH2 ?&flip-y
+        !&select
+    &flip-y
+        .heading LDZ #20 ORA .heading STZ
+    &select
+        .heading/x LDZ2 #01 SFT2 .heading/y LDZ2 GTH2 ?&east
+        .heading/y LDZ2 #01 SFT2 .heading/x LDZ2 GTH2 ?&north
+        ;sprites/diagonal !&draw
+    &east
+        .heading LDZ #df AND .heading STZ
+        ;sprites !&draw
+    &north
+        .heading LDZ #ef AND .heading STZ
+        ;sprites/north
+    &draw
+        .Screen/addr DEO2
+        .sprite-x/y LDZ2 draw-sprite-row
+        .sprite-x/y LDZ2 wrapped-origin ?draw-sprite-row
+        POP2 JMP2r
+
+@draw-sprite-row ( y* -- )
+    .Screen/y DEO2
+    .sprite-x LDZ2 .Screen/x DEO2
+    .heading LDZ .Screen/sprite DEO
+    .sprite-x LDZ2 wrapped-origin ?&copy
+    POP2 JMP2r
+    &copy
+        .Screen/x DEO2
+        .heading LDZ .Screen/sprite DEO
+        JMP2r
+
+@wrapped-origin ( coordinate* -- copy* needed )
+    DUP2 #8000 LTH2 ?&check-far-edge
+    #0200 ADD2 #01 JMP2r
+    &check-far-edge
+        DUP2 #01f9 LTH2 ?&inside
+        #0200 SUB2 #01 JMP2r
+    &inside #00 JMP2r
+
+@next-boid ( -- more )
+    .boid LDZ2 #0020 ADD2 DUP2 .boid STZ2 ;flock-end NEQ2 JMP2r
+
+@random ( -- value* )
+    ( Xorshift16 with a nonzero seed. )
+    .seed LDZ2
+    DUP2 #70 SFT2 EOR2
+    DUP2 #09 SFT2 EOR2
+    DUP2 #80 SFT2 EOR2
+    DUP2 .seed STZ2 JMP2r
+
+@whole-units ( offset* -- units* )
+    DUP2 #8000 LTH2 ?&positive
+    #0000 SWP2 SUB2 #08 SFT2 #0000 SWP2 SUB2 JMP2r
+    &positive #08 SFT2 JMP2r
+
+@signed-div ( value* divisor* -- quotient* )
+    OVR2 #8000 LTH2 ?&positive
+    STH2 #0000 SWP2 SUB2 STH2r DIV2 #0000 SWP2 SUB2 JMP2r
+    &positive DIV2 JMP2r
+
+@abs16 ( value* -- magnitude* )
+    DUP2 #8000 LTH2 ?&done
+    #0000 SWP2 SUB2
+    &done JMP2r
+
+@limit-magnitude ( value* limit* -- value* )
+    STH2 DUP2 abs16 STH2kr GTH2 ?&limit
+    POP2r JMP2r
+    &limit
+        #8000 LTH2 ?&positive
+        #0000 STH2r SUB2 JMP2r
+    &positive STH2r JMP2r
+
+@initial-velocities
+    0140 0000 00e0 00e0 0000 0140 ff20 00e0
+    fec0 0000 ff20 ff20 0000 fec0 00e0 ff20
+
+( Each 2bpp tile stores its highlight plane first, then its silhouette. )
+@sprites [ 0000 000c 3e0c 0000 0020 303c 7e3c 3020
+    &north 0008 081c 1c08 0000 0008 1c1c 3e7f 2a08
+    &diagonal 0006 0e1c 3820 0000 000e 1e3e 3c68 7020 ]
+
+@grid $0080
+( 160 records of 32 bytes. Each stores position, velocity, next velocity,
+  a link to the next boid in the cell, two spare bytes, and four trail positions. )
+@flock $1400
+@flock-end
