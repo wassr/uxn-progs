@@ -1,0 +1,776 @@
+( Copyright 2026 Noel Atzwanger (@wassr) <me@wassr.cc>                      )
+(                                                                           )
+( Licensed under the Apache License, Version 2.0 (the "License");           )
+( you may not use this file except in compliance with the License.          )
+( You may obtain a copy of the License at                                   )
+(                                                                           )
+(     http://www.apache.org/licenses/LICENSE-2.0                            )
+(                                                                           )
+( Unless required by applicable law or agreed to in writing, software       )
+( distributed under the License is distributed on an "AS IS" BASIS,         )
+( WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  )
+( See the License for the specific language governing permissions and       )
+( limitations under the License.                                            )
+
+( Fly - bank-0 Uxn / Varvara flight demo. Build with make fly. )
+( Left-handed view: X right, Y up, positive Z into the scene. )
+( Camera forward is positive Z. Screen origin is the top left. )
+( World X/Z are unsigned 12.4, wrapping at 4096 units per axis. )
+( Altitude and speed are in sixteenths of a unit. Angles are byte turns. )
+( Single-threaded vectors own zero-page scratch until BRK. Subroutines )
+( use the return stack for saved temporaries as well as call addresses. )
+
+( Program and static data: 0100 up to the first buffer. )
+( Buffers: 4000-6fff colors, 7000-cfff unsigned reciprocal depth, )
+( d000-d3ff terrain heights, d400-fe2f terrain vertices, )
+( fe30-feef aircraft vertices, fef0-ff07 near-plane intersections, )
+( ff08-ff0f clipped polygon pointers, ff10-ff1f sprite staging. )
+%WIDTH { #0080 }
+%HEIGHT { #0060 }
+%NEAR { #0010 }
+%CHASE-BACK { #0021 }
+%CHASE-UP { #0013 }
+%GRID { #1e }
+%CENTER { #0e }
+%GRID-ORIGIN { #00e0 } ( CENTER times 16 world units )
+%GRID-STRIDE { #0168 } ( GRID times 12 bytes per vertex )
+%U8 { #00 SWP }
+%SIGN { POP #80 AND }
+%NEG16 { #0000 SWP2 SUB2 }
+%NEXT2 { INC2 INC2 }
+%COLOR-BUFFER { ;fly-color }
+%DEPTH-BUFFER { ;fly-depth }
+
+|00
+@flight
+    &x $2 &z $2 &alt $2 &speed $2
+    &heading $1 &pitch $1 &bank $1
+    &sin $2 &cos $2 &recovery $1
+    &buttons $1 &paused $1 &start-held $1 &stats $1
+    &dx $2 &dz $2 &dy $2
+@fps
+    &visible $1 &second $1 &count $1 &value $1
+@cache
+    &x $1 &z $1 &target-x $1 &target-z $1
+    &sample-x $1 &sample-z $1 &count $1
+@noise
+    &x $1 &z $1 &mask $1 &seed $1
+    &fx $2 &fz $2 &scale $1
+@scene
+    &x $2 &z $2 &alt $2 &sin $2 &cos $2
+    &column $1 &row $1 &ptr $2
+    &dx $2 &dy $2 &dz $2
+    &nw $2 &ne $2 &sw $2 &se $2
+    &h0 $1 &h1 $1 &h2 $1 &h3 $1
+    &shade $1 &mesh $2
+    &collision-h $2 &collision-u $2 &collision-v $2
+@sky
+    &center-x $2 &top $2 &row $1
+@clip
+    &a $2 &b $2 &c $2 &prev $2 &curr $2
+    &write $2 &scratch $2
+    &outside $2 &inside $2 &gap $2 &range $2
+@tri
+    &a $2 &b $2 &c $2
+    &dx1 $2 &dx2 $2 &dy1 $2 &dy2 $2 &dd1 $2 &dd2 $2
+    &det-hi $2 &det-lo $2
+    &gx-hi $2 &gx-lo $2 &gy-hi $2 &gy-lo $2
+    &y $2 &last $2 &left $2 &right $2
+    &p $2 &q $2 &x1 $2 &y1 $2
+    &pixel $2 &stop $2 &depth $2
+    &d-hi $2 &d-lo $2 &colors $2
+@blit
+    &tile $2 &row $2 &ptr $2 &end $2
+    &x $2 &y $2 &lo $1 &hi $1 &count $1
+
+|0100
+@on-reset ( -- | initializes devices and flight state )
+    WIDTH .screen/width DEO2 HEIGHT .screen/height DEO2
+    #148f .system/r DEO2 #26ad .system/g DEO2 #3799 .system/b DEO2
+    #00 .flight/stats STZ #00 .fps/visible STZ
+    reset-flight render
+    ;on-frame .screen/vector DEO2
+    ;on-controller .controller/vector DEO2 BRK
+
+@on-frame ( -- | one fixed simulation step and render per screen event )
+    .flight/paused LDZ ?&done
+    .controller/button DEI .flight/buttons STZ
+    step-flight render
+    &done BRK
+
+@on-controller ( -- | R or Start resets, P toggles pause, H stats, F frame rate )
+    .controller/key DEI #20 ORA
+    DUP #72 EQU ?&reset-key
+    DUP #70 EQU ?&pause-key
+    DUP #68 EQU ?&stats-key
+    #66 EQU ?&fps
+    .controller/button DEI #08 AND
+    DUP .flight/start-held LDZ #00 EQU AND STH
+    .flight/start-held STZ STHr ?&reset
+    BRK
+    &reset-key POP
+    &reset reset-flight render BRK
+    &pause-key POP
+        .flight/paused LDZ #01 EOR .flight/paused STZ reset-fps !&redraw-hud
+    &stats-key POP
+        .flight/stats LDZ #01 EOR .flight/stats STZ !&redraw-hud
+    &fps .fps/visible LDZ #01 EOR .fps/visible STZ reset-fps
+    &redraw-hud draw-hud BRK
+
+@reset-flight ( -- | resets controls, cache and aircraft to a reproducible start )
+    #8070 .flight/x STZ2 #5280 .flight/z STZ2
+    #0018 .flight/speed STZ2
+    #00 .flight/heading STZ #00 .flight/pitch STZ #00 .flight/bank STZ
+    #00 .flight/paused STZ #00 .flight/recovery STZ
+    #00 .flight/buttons STZ reset-fps
+    update-heading cache-target
+    .cache/target-x LDZ .cache/x STZ .cache/target-z LDZ .cache/z STZ
+    rebuild-cache
+    ground-height #001b ADD2 #40 SFT2 .flight/alt STZ2 JMP2r
+
+@update-heading ( -- )
+    .flight/heading LDZ DUP trig8/sin .flight/sin STZ2
+    trig8/cos .flight/cos STZ2 JMP2r
+
+@step-flight ( -- | applies latched controls and advances one simulation tick )
+    .flight/buttons LDZ #10 AND ?&nose-down
+    .flight/buttons LDZ #20 AND ?&nose-up
+    .flight/pitch LDZ approach-zero !&pitch
+    &nose-up .flight/pitch LDZ math/sfrom8 INC2 #ffe8 #0018 math/sclamp16 NIP !&pitch
+    &nose-down .flight/pitch LDZ math/sfrom8 #0001 SUB2 #ffe8 #0018 math/sclamp16 NIP
+    &pitch .flight/pitch STZ
+    .flight/buttons LDZ #40 AND ?&bank-left
+    .flight/buttons LDZ #80 AND ?&bank-right
+    .flight/bank LDZ approach-zero !&bank
+    &bank-left .flight/bank LDZ math/sfrom8 #0002 SUB2 #ffe0 #0020 math/sclamp16 NIP !&bank
+    &bank-right .flight/bank LDZ math/sfrom8 #0002 ADD2 #ffe0 #0020 math/sclamp16 NIP
+    &bank DUP .flight/bank STZ math/sfrom8 #0010 math/sdiv16 NIP
+    .flight/heading LDZ ADD .flight/heading STZ
+    .flight/buttons LDZ #01 AND ?&faster
+    .flight/buttons LDZ #02 AND ?&slower
+    !&move
+    &faster .flight/speed LDZ2 INC2 #0028 math/umin16 .flight/speed STZ2 !&move
+    &slower .flight/speed LDZ2 #0001 SUB2 #0008 math/umax16 .flight/speed STZ2
+    &move
+        update-heading
+        .flight/speed LDZ2 .flight/sin LDZ2 scale .flight/dx STZ2
+        .flight/speed LDZ2 .flight/cos LDZ2 scale .flight/dz STZ2
+        .flight/speed LDZ2 .flight/pitch LDZ trig8/sin scale .flight/dy STZ2
+        .flight/recovery LDZ DUP ?&decay POP !&midpoint
+    &decay #01 SUB .flight/recovery STZ
+    &midpoint
+        .flight/dx LDZ2 split-step .flight/dx STZ2
+        .flight/dz LDZ2 split-step .flight/dz STZ2
+        .flight/dy LDZ2 split-step .flight/dy STZ2
+        integrate-flight ?&done
+        .flight/dx LDZ2 .flight/dz LDZ2 .flight/dy LDZ2 integrate-flight POP
+    &done JMP2r
+
+@split-step ( d** -- first** second** | halves signed displacement; sum is d )
+    DUP2 #01 math/srsh16 SWP2 OVR2 SUB2 JMP2r
+
+@integrate-flight ( dx** dz** dy** -- recovered | cache follows each half-step )
+    .flight/alt LDZ2 ADD2 #0000 #0680 math/sclamp16 .flight/alt STZ2
+    .flight/z LDZ2 ADD2 .flight/z STZ2
+    .flight/x LDZ2 ADD2 .flight/x STZ2
+    scroll-cache
+    ground-height DUP2 #0006 ADD2 #40 SFT2 .flight/alt LDZ2 GTH2 ?&recover
+    POP2 #00 JMP2r
+    &recover
+        #0014 ADD2 #40 SFT2 .flight/alt STZ2
+        #00 .flight/pitch STZ #00 .flight/bank STZ
+        #0014 .flight/speed STZ2 #50 .flight/recovery STZ #01 JMP2r
+
+@approach-zero ( signed -- signed | moves one angle unit toward zero )
+    DUP #00 EQU ?&done
+    DUP #80 AND ?&negative
+    #01 SUB JMP2r
+    &negative INC
+    &done JMP2r
+
+@scale ( value** coefficient** -- product** | signed times Q8, truncate toward zero )
+    ( Coefficient magnitude is at most 256. The result wraps at 16 bits. )
+    ( A value magnitude below 256 can use the native short product. )
+    OVR2 OVR2 EOR2 SIGN STH
+    math/abs16 SWP2 math/abs16 DUP2 POP ?&wide
+    MUL2 #08 SFT2 !&signed
+    &wide math/umul-wide16 POP ROT POP
+    &signed STHr ?&negative JMP2r
+    &negative NEG16 JMP2r
+
+( Terrain cache. A sample is 16 world units apart. Only the 30x30 )
+( sampled window is valid. The low five bits address the 32x32 ring. )
+@cache-target ( -- )
+    .flight/x LDZ CENTER SUB .cache/target-x STZ
+    .flight/z LDZ CENTER SUB .cache/target-z STZ JMP2r
+
+@cache-address ( sample-x sample-z -- address** )
+    #1f AND U8 #50 SFT2 ROT #1f AND U8 ORA2 ;fly-heights ADD2 JMP2r
+
+@cached-height ( sample-x sample-z -- height )
+    cache-address LDA JMP2r
+
+@write-height ( -- | fills the ring slot for cache/sample-x and /sample-z )
+    .cache/sample-x LDZ .cache/sample-z LDZ height
+    .cache/sample-x LDZ .cache/sample-z LDZ cache-address STA JMP2r
+
+@fill-row ( sample-z -- | fills GRID samples starting at cache/x )
+    .cache/sample-z STZ .cache/x LDZ .cache/sample-x STZ
+    GRID .cache/count STZ
+    &loop write-height
+        .cache/sample-x LDZ INC .cache/sample-x STZ
+        .cache/count LDZ #01 SUB DUP .cache/count STZ ?&loop
+    JMP2r
+
+@fill-column ( sample-x -- | fills GRID samples starting at cache/z )
+    .cache/sample-x STZ .cache/z LDZ .cache/sample-z STZ
+    GRID .cache/count STZ
+    &loop write-height
+        .cache/sample-z LDZ INC .cache/sample-z STZ
+        .cache/count LDZ #01 SUB DUP .cache/count STZ ?&loop
+    JMP2r
+
+@rebuild-cache ( -- | initializes all samples in the current window )
+    .cache/z LDZ GRID
+    &row ( sample-z rows-left )
+        OVR fill-row SWP INC SWP #01 SUB DUP ?&row
+    POP2 JMP2r
+
+@scroll-cache ( -- | movement is <16 units/tick, at most one new row and column )
+    cache-target
+    .cache/target-x LDZ .cache/x LDZ SUB DUP #00 EQU ?&same-x
+    #01 EQU .cache/target-x LDZ DUP .cache/x STZ SWP ?&right
+    fill-column !&z
+    &right GRID #01 SUB ADD fill-column !&z
+    &same-x POP
+    &z
+        .cache/target-z LDZ .cache/z LDZ SUB DUP #00 EQU ?&same-z
+        #01 EQU .cache/target-z LDZ DUP .cache/z STZ SWP ?&forward
+        !fill-row
+    &forward GRID #01 SUB ADD !fill-row
+    &same-z POP JMP2r
+
+@height ( sample-x sample-z -- height | 10 through 74, with sea at 10 )
+    DUP2 #04 #0f ;world-seed LDA #21 EOR octave NIP #02 SFT STH
+    #02 #3f ;world-seed LDA #be EOR octave NIP #03 SFT STHr ADD
+    #1e GTHk ?&land POP2 #0a JMP2r
+    &land POP #14 SUB JMP2r
+
+@octave ( x z shift mask seed -- sample | clobbers noise scratch )
+    ( Shift is 2 or 4. Lattice indices wrap at the corresponding mask. )
+    .noise/seed STZ .noise/mask STZ .noise/scale STZ
+    DUP .noise/scale LDZ SFT .noise/z STZ
+    octave-weight .noise/fz STZ2
+    DUP .noise/scale LDZ SFT .noise/x STZ
+    octave-weight .noise/fx STZ2
+    .noise/z LDZ octave-row STH2
+    .noise/z LDZ INC octave-row STH2r SWP2 .noise/fz LDZ2 !weight-mix
+
+@octave-weight ( coordinate -- weight** | smoothstep with denominator 256 )
+    #04 .noise/scale LDZ SUB #40 SFT SFT #0f AND
+    U8 #10 SFT2 ;smoothstep ADD2 LDA2 JMP2r
+
+@octave-row ( z -- noise** | interpolate one horizontal lattice edge )
+    DUP .noise/x LDZ SWP octave-corner STH2
+    .noise/x LDZ INC SWP octave-corner STH2r SWP2 .noise/fx LDZ2 !weight-mix
+
+@octave-corner ( x z -- n** )
+    .noise/mask LDZ AND SWP .noise/mask LDZ AND SWP
+    .noise/seed LDZ hash2d/word POP U8 JMP2r
+
+@weight-mix ( a** b** weight** -- y** | unsigned bytes widened, weight 0..256 )
+    DUP2 STH2 MUL2 SWP2 #0100 STH2r SUB2 MUL2 ADD2 #08 SFT2 JMP2r
+
+@world-seed 00
+
+@smoothstep
+    0000 0003 000b 0018 0028 003b 0051 0068
+    0080 0098 00af 00c5 00d8 00e8 00f5 00fd
+
+@ground-height ( -- height** | samples NW-SE triangle at the aircraft )
+    .flight/x LDZ .flight/z LDZ
+    DUP2 cached-height DUP .scene/h0 STZ U8 .scene/collision-h STZ2
+    INC DUP2 cached-height .scene/h2 STZ
+    SWP INC SWP cached-height .scene/h3 STZ
+    .flight/x INC LDZ U8 .scene/collision-u STZ2
+    .flight/z INC LDZ U8 .scene/collision-v STZ2
+    .scene/collision-u LDZ2 .scene/collision-v LDZ2 LTH2 ?&south
+    .flight/x LDZ INC .flight/z LDZ cached-height .scene/h1 STZ
+    .scene/collision-u LDZ2 .scene/collision-v LDZ2 !&interpolate
+    &south
+        .scene/h2 LDZ .scene/h1 STZ
+        .scene/collision-v LDZ2 .scene/collision-u LDZ2
+    &interpolate ( major** minor** )
+        .scene/h3 LDZ U8 .scene/h1 LDZ U8 SUB2 SWP2 scale STH2
+        .scene/h1 LDZ U8 .scene/h0 LDZ U8 SUB2 SWP2 scale
+        STH2r ADD2 .scene/collision-h LDZ2 ADD2 JMP2r
+
+( A vertex stores six big-endian words: camera X/Y/Z, screen X/Y, )
+( and reciprocal depth. Projected fields are valid only at Z >= NEAR. )
+%V-Y { NEXT2 }
+%V-Z { #0004 ADD2 }
+%V-SCREEN { #0006 ADD2 }
+%V-DEPTH { #0004 ADD2 }
+
+@render ( -- | consumes scene, clip, tri and presentation scratch )
+    COLOR-BUFFER #3000 #02 memory/set
+    DEPTH-BUFFER #6000 #0000 memory/set2
+    ( Camera looks down at a shallow angle, following half the pitch. )
+    .flight/pitch LDZ math/sfrom8 #01 math/srsh16 NIP #0c SUB
+    DUP trig8/cos .scene/cos STZ2 trig8/sin .scene/sin STZ2
+    .flight/alt LDZ2 #04 SFT2 CHASE-UP ADD2 .scene/alt STZ2
+    .flight/x INC LDZ #04 SFT U8 .scene/x STZ2
+    .flight/z INC LDZ #04 SFT U8 .scene/z STZ2
+    draw-sun terrain-vertices terrain-faces aircraft present
+    .fps/visible LDZ ?&measure
+    !draw-hud
+    &measure .datetime/second DEI fps-frame !draw-hud
+
+@reset-fps ( -- | marks the clock and published value as unknown )
+    #ff .fps/second STZ #ff .fps/value STZ #00 .fps/count STZ JMP2r
+
+@fps-frame ( second -- | counts completed scene frames in aligned clock seconds )
+    ( Count zero means the current second started before sampling. )
+    DUP #3c LTH #00 EQU ?&invalid
+    DUP .fps/second LDZ EQU ?&same
+    .fps/second LDZ #ff EQU ?&first
+    .fps/second LDZ INC DUP #3c EQU ?&wrap
+    !&compare
+    &wrap POP #00
+    &compare OVR EQU ?&elapsed
+        #ff .fps/value STZ #00 .fps/count STZ !&first
+    &elapsed
+        .fps/count LDZ DUP ?&publish
+        POP !&begin
+    &publish .fps/value STZ
+    &begin .fps/second STZ #01 .fps/count STZ JMP2r
+    &first .fps/second STZ JMP2r
+    &same POP .fps/count LDZ DUP ?&increment POP JMP2r
+    &increment INC #fe math/umin8 .fps/count STZ JMP2r
+    &invalid POP !reset-fps
+
+@draw-sun ( -- | projects a world-space light direction into the sky color buffer )
+    #16 .flight/heading LDZ SUB DUP STH trig8/sin
+    #0040 SWP2 scale STHr trig8/cos #0040 SWP2 scale
+    #0006 SWP2 view-pitch ;fly-intersect save-vertex
+    ;fly-intersect in-front #00 EQU ?&done
+    ;fly-intersect V-SCREEN LDA2 .sky/center-x STZ2
+    ;fly-intersect V-SCREEN V-Y LDA2 #0004 SUB2 .sky/top STZ2
+    #00 .sky/row STZ
+    &row
+        .sky/top LDZ2 .sky/row LDZ U8 ADD2
+        DUP2 HEIGHT LTH2 ?&visible POP2 !&next
+    &visible
+        #70 SFT2 COLOR-BUFFER ADD2 STH2
+        .sky/row LDZ U8 ;sun-widths ADD2 LDA U8
+        .sky/center-x LDZ2 OVR2 ADD2 INC2 WIDTH math/smin16 STH2
+        .sky/center-x LDZ2 SWP2 SUB2 #0000 math/smax16
+        STH2r OVR2 SUB2 DUP2 #0000 math/sgt16 ?&span
+        POP2 POP2 POP2r !&next
+    &span
+        SWP2 STH2r ADD2 SWP2 #03 memory/set
+    &next
+        .sky/row LDZ INC DUP .sky/row STZ #09 LTH ?&row
+    &done JMP2r
+
+@sun-widths 02 03 04 04 04 04 04 03 02
+
+@terrain-vertices ( -- | transforms each cached height once )
+    ;fly-terrain .scene/ptr STZ2
+    #00 .scene/row STZ
+    &row
+        .scene/row LDZ U8 #40 SFT2 GRID-ORIGIN SUB2 .scene/z LDZ2 SUB2 .scene/dz STZ2
+        #00 .scene/column STZ
+    &column
+        .scene/column LDZ U8 #40 SFT2 GRID-ORIGIN SUB2 .scene/x LDZ2 SUB2 .scene/dx STZ2
+        .scene/column LDZ .cache/x LDZ ADD
+        .scene/row LDZ .cache/z LDZ ADD cached-height U8 .scene/alt LDZ2 SUB2 .scene/dy STZ2
+        .scene/dx LDZ2 .flight/cos LDZ2 scale
+        .scene/dz LDZ2 .flight/sin LDZ2 scale SUB2
+        .scene/dy LDZ2
+        .scene/dx LDZ2 .flight/sin LDZ2 scale
+        .scene/dz LDZ2 .flight/cos LDZ2 scale ADD2 CHASE-BACK ADD2
+        view-pitch .scene/ptr LDZ2 save-vertex
+        .scene/ptr LDZ2 #000c ADD2 .scene/ptr STZ2
+        .scene/column LDZ INC DUP .scene/column STZ GRID LTH ?&column
+        .scene/row LDZ INC DUP .scene/row STZ GRID LTH ?&row
+    JMP2r
+
+@view-pitch ( x** y** z** -- x** view-y** view-z** )
+    OVR2 OVR2 STH2 STH2
+    .scene/sin LDZ2 scale SWP2 .scene/cos LDZ2 scale SWP2 SUB2
+    STH2r .scene/sin LDZ2 scale STH2r .scene/cos LDZ2 scale ADD2 JMP2r
+
+@save-vertex ( x** y** z** ptr** -- | projects on the visible side )
+    STH2
+    STH2kr V-Z STA2 STH2kr V-Y STA2 STH2kr STA2
+    STH2r DUP2 V-Z LDA2 SIGN ?&hidden
+    DUP2 V-Z LDA2 NEAR LTH2 ?&hidden
+    !project
+    &hidden POP2 JMP2r
+
+@project ( ptr** -- | positive Z >= NEAR; focal length 64 pixels )
+    STH2
+    STH2kr LDA2 #60 SFT2 STH2kr V-Z LDA2 math/sdiv16 #0040 ADD2
+    STH2kr V-SCREEN STA2
+    #0030 STH2kr V-Y LDA2 #60 SFT2 STH2kr V-Z LDA2 math/sdiv16 SUB2
+    STH2kr V-SCREEN NEXT2 STA2
+    #fff0 STH2kr V-Z LDA2 DIV2 STH2r V-SCREEN V-DEPTH STA2 JMP2r
+
+@terrain-faces ( -- | visits the two triangles of each NW-SE cell )
+    ;fly-terrain .scene/nw STZ2
+    #00 .scene/row STZ
+    &row #00 .scene/column STZ
+    &cell
+        .scene/nw LDZ2 #000c ADD2 .scene/ne STZ2
+        .scene/nw LDZ2 GRID-STRIDE ADD2 DUP2 .scene/sw STZ2 #000c ADD2 .scene/se STZ2
+        ( Reject cells behind the near plane before calculating lighting. )
+        .scene/nw LDZ2 in-front .scene/ne LDZ2 in-front ORA
+        .scene/sw LDZ2 in-front ORA .scene/se LDZ2 in-front ORA #00 EQU ?&next
+        .scene/column LDZ .cache/x LDZ ADD
+        .scene/row LDZ .cache/z LDZ ADD
+        DUP2 cached-height .scene/h0 STZ
+        DUP2 SWP INC SWP cached-height .scene/h1 STZ
+        INC DUP2 cached-height .scene/h2 STZ
+        SWP INC SWP cached-height .scene/h3 STZ
+        .scene/h0 LDZ .scene/h1 LDZ .scene/h3 LDZ
+        .scene/nw LDZ2 face-shade .scene/shade STZ
+        .scene/nw LDZ2 .scene/ne LDZ2 .scene/se LDZ2 clip-face
+        .scene/h0 LDZ .scene/h2 LDZ .scene/h3 LDZ
+        .scene/nw LDZ2 face-shade .scene/shade STZ
+        .scene/nw LDZ2 .scene/se LDZ2 .scene/sw LDZ2 clip-face
+    &next
+        .scene/nw LDZ2 #000c ADD2 .scene/nw STZ2
+        .scene/column LDZ INC DUP .scene/column STZ GRID #01 SUB LTH ?&cell
+        .scene/nw LDZ2 #000c ADD2 .scene/nw STZ2
+        .scene/row LDZ INC DUP .scene/row STZ GRID #01 SUB LTH ?&row
+    JMP2r
+
+@face-shade ( h0 h1 h2 ptr** -- shade | 0..12 levels )
+    V-Z LDA2 #0060 math/sgt16 STH
+    OVR #0a EQU OVR #0a EQU AND STH
+    ROT DUP #0a EQU STHr AND ?&water
+    ( Signed slope along the cell diagonal, plus elevation. )
+    U8 #10 SFT2 STH2 U8 STH2 U8 STH2r ADD2 STH2r SUB2
+    #02 math/srsh16 #0007 ADD2 #0004 #000a math/sclamp16 NIP
+    STHr ?&fog JMP2r
+    &fog #07 ADD #01 SFT JMP2r
+    &water POP POP2 STHr ?&far-water #04 JMP2r
+    &far-water #06 JMP2r
+
+( Mesh coordinates are signed integer bytes. Triangles are two-sided )
+( and list indices into the twelve-byte vertex records. )
+@aircraft ( -- | transforms the local mesh and submits it to the same depth buffer )
+    .flight/bank LDZ DUP trig8/sin .scene/dx STZ2 trig8/cos .scene/dy STZ2
+    .flight/pitch LDZ DUP trig8/sin .scene/z STZ2 trig8/cos .scene/x STZ2
+    ;aircraft-points .scene/mesh STZ2 ;fly-aircraft .scene/ptr STZ2
+    &point
+        .scene/mesh LDZ2 LDAk math/sfrom8 STH2 INC2
+        LDAk math/sfrom8 STH2 INC2 LDA math/sfrom8 .scene/dz STZ2
+        STH2r STH2r ( y** x** )
+        OVR2 OVR2 .scene/dy LDZ2 scale SWP2 .scene/dx LDZ2 scale ADD2 STH2
+        .scene/dx LDZ2 scale SWP2 .scene/dy LDZ2 scale SWP2 SUB2
+        DUP2 .scene/x LDZ2 scale .scene/dz LDZ2 .scene/z LDZ2 scale ADD2 CHASE-UP SUB2
+        SWP2 .scene/z LDZ2 scale .scene/dz LDZ2 .scene/x LDZ2 scale SWP2 SUB2 CHASE-BACK ADD2
+        STH2r ROT2 ROT2 view-pitch .scene/ptr LDZ2 save-vertex
+        .scene/ptr LDZ2 #000c ADD2 .scene/ptr STZ2
+        .scene/mesh LDZ2 #0003 ADD2 DUP2 .scene/mesh STZ2 ;aircraft-points-end LTH2 ?&point
+    ;aircraft-faces .scene/mesh STZ2
+    &face
+        .scene/mesh LDZ2 LDAk .scene/shade STZ INC2
+        LDAk mesh-vertex STH2 INC2 LDAk mesh-vertex STH2 INC2 LDA mesh-vertex
+        STH2r STH2r ROT2 ROT2 clip-face
+        .scene/mesh LDZ2 #0004 ADD2 DUP2 .scene/mesh STZ2 ;aircraft-faces-end LTH2 ?&face
+    JMP2r
+
+@mesh-vertex ( index -- address** )
+    U8 #000c MUL2 ;fly-aircraft ADD2 JMP2r
+
+@aircraft-points ( x y z )
+    00 00 06 ( 0 nose )
+    fe 00 ff ( 1 left shoulder )
+    02 00 ff ( 2 right shoulder )
+    00 03 fe ( 3 canopy )
+    f6 00 fc ( 4 left wingtip, front )
+    f7 00 f8 ( 5 left wingtip, back )
+    0a 00 fc ( 6 right wingtip, front )
+    09 00 f8 ( 7 right wingtip, back )
+    00 00 f7 ( 8 tail root )
+    00 05 f7 ( 9 fin )
+    fc 00 f6 ( 10 left tailplane )
+    04 00 f6 ( 11 right tailplane )
+    00 ff ff ( 12 keel )
+@aircraft-points-end
+@aircraft-faces ( shade a b c )
+    0c 00 03 01 09 00 02 03 03 00 01 02 04 01 03 08 0c 02 08 03
+    01 01 04 05 03 01 05 08 04 02 07 06 02 02 08 07
+    00 03 09 08 01 01 08 0a 02 02 0b 08
+    03 00 01 0c 04 00 0c 02 02 01 08 0c 02 02 0c 08
+@aircraft-faces-end
+
+@in-front ( vertex** -- flag )
+    V-Z LDA2 DUP2 SIGN STH NEAR LTH2 STHr ORA #00 EQU JMP2r
+
+@clip-face ( a** b** c** -- | near-plane clipping, clobbers clip and triangle scratch )
+    .clip/c STZ2 .clip/b STZ2 .clip/a STZ2
+    .clip/a LDZ2 in-front .clip/b LDZ2 in-front .clip/c LDZ2 in-front
+    ADD ADD DUP #00 EQU ?&reject
+    #03 EQU ?&direct
+    ;fly-polygon .clip/write STZ2 ;fly-intersect .clip/scratch STZ2
+    .clip/c LDZ2 .clip/prev STZ2
+    .clip/a LDZ2 clip-edge .clip/b LDZ2 clip-edge .clip/c LDZ2 clip-edge
+    ;fly-polygon LDA2 ;fly-polygon NEXT2 LDA2 ;fly-polygon #0004 ADD2 LDA2 triangle
+    .clip/write LDZ2 ;fly-polygon #0008 ADD2 NEQ2 ?&done
+    ;fly-polygon LDA2 ;fly-polygon #0004 ADD2 LDA2
+    ;fly-polygon #0006 ADD2 LDA2 !triangle
+    &reject POP
+    &done JMP2r
+    &direct .clip/a LDZ2 .clip/b LDZ2 .clip/c LDZ2 !triangle
+
+@clip-edge ( curr** -- | appends crossing and current vertex, in polygon order )
+    .clip/curr STZ2
+    .clip/prev LDZ2 in-front .clip/curr LDZ2 in-front STHk NEQ ?&crossing
+    !&endpoint
+    &crossing
+        .clip/prev LDZ2 .clip/curr LDZ2 STHkr ?&ordered SWP2
+        &ordered intersect polygon-append
+    &endpoint
+        STHr ?&inside
+        !&advance
+    &inside .clip/curr LDZ2 polygon-append
+    &advance .clip/curr LDZ2 .clip/prev STZ2 JMP2r
+
+@polygon-append ( ptr** -- )
+    .clip/write LDZ2 STA2 .clip/write LDZ2 NEXT2 .clip/write STZ2 JMP2r
+
+@intersect ( outside** inside** -- new** | directional rounding is shared across faces )
+    .clip/inside STZ2 .clip/outside STZ2
+    NEAR .clip/outside LDZ2 V-Z LDA2 SUB2 .clip/gap STZ2
+    .clip/inside LDZ2 V-Z LDA2 .clip/outside LDZ2 V-Z LDA2 SUB2 .clip/range STZ2
+    .clip/outside LDZ2 .clip/inside LDZ2 interpolate-axis
+    .clip/outside LDZ2 V-Y .clip/inside LDZ2 V-Y interpolate-axis
+    NEAR .clip/scratch LDZ2 save-vertex
+    .clip/scratch LDZ2 DUP2 #000c ADD2 .clip/scratch STZ2 JMP2r
+
+@interpolate-axis ( outside-addr** inside-addr** -- value** )
+    LDA2 SWP2 LDA2 DUP2 STH2 SUB2
+    .clip/gap LDZ2 .clip/range LDZ2 #00 ratio-offset STH2r ADD2 JMP2r
+
+@ratio-offset ( delta** distance** extent** ceil -- offset** )
+    ( Signed delta, unsigned distance and nonzero extent. The caller )
+    ( supplies distance <= extent. Rounds toward zero or toward +inf. )
+    STH STH2 OVR2 SIGN STH
+    SWP2 math/abs16 math/umul-wide16
+    STHr STH2r ROT STH ( hi** lo** extent** [ceil negative] )
+    ROT2 DUP2 ORA ?&wide POP2
+    DIV2k DUP2 STH2 MUL2 SUB2 ORA STH2r ROT !&round
+    &wide ROT2 ROT2 #0000 SWP2 int32/udivmod ORA2 ORA STH NIP2 STHr
+    &round ( quotient** remainder-flag [ceil negative] )
+    STHr ?&negative
+    STHr AND ?&up JMP2r
+    &up INC2 JMP2r
+    &negative POP STHr POP NEG16 JMP2r
+
+@triangle ( a** b** c** -- | accepts either winding and skips zero-area faces )
+    V-SCREEN .tri/c STZ2 V-SCREEN .tri/b STZ2 V-SCREEN .tri/a STZ2
+    .tri/a LDZ2 LDA2 .tri/b LDZ2 LDA2 .tri/c LDZ2 LDA2
+    math/smax16 math/smax16 #0000 math/slt16 ?&done
+    .tri/a LDZ2 LDA2 .tri/b LDZ2 LDA2 .tri/c LDZ2 LDA2
+    math/smin16 math/smin16 WIDTH math/slt16 #00 EQU ?&done
+    .tri/a LDZ2 V-Y LDA2 .tri/b LDZ2 V-Y LDA2 .tri/c LDZ2 V-Y LDA2
+    math/smax16 math/smax16 HEIGHT math/smin16 .tri/last STZ2
+    .tri/a LDZ2 V-Y LDA2 .tri/b LDZ2 V-Y LDA2 .tri/c LDZ2 V-Y LDA2
+    math/smin16 math/smin16 #0000 math/smax16
+    DUP2 .tri/y STZ2 .tri/last LDZ2 math/slt16 #00 EQU ?&done
+    .tri/b LDZ2 LDA2 .tri/a LDZ2 LDA2 SUB2 .tri/dx1 STZ2
+    .tri/c LDZ2 LDA2 .tri/a LDZ2 LDA2 SUB2 .tri/dx2 STZ2
+    .tri/b LDZ2 V-Y LDA2 .tri/a LDZ2 V-Y LDA2 SUB2 .tri/dy1 STZ2
+    .tri/c LDZ2 V-Y LDA2 .tri/a LDZ2 V-Y LDA2 SUB2 .tri/dy2 STZ2
+    .tri/dx1 LDZ2 .tri/dy2 LDZ2 .tri/dx2 LDZ2 .tri/dy1 LDZ2 cross
+    DUP2 .tri/det-lo STZ2 OVR2 .tri/det-hi STZ2
+    int32/is-zero ?&done
+    .tri/b LDZ2 V-DEPTH LDA2 .tri/a LDZ2 V-DEPTH LDA2 SUB2 .tri/dd1 STZ2
+    .tri/c LDZ2 V-DEPTH LDA2 .tri/a LDZ2 V-DEPTH LDA2 SUB2 .tri/dd2 STZ2
+    .tri/dd1 LDZ2 .tri/dy2 LDZ2 .tri/dd2 LDZ2 .tri/dy1 LDZ2 depth-gradient
+    .tri/gx-lo STZ2 .tri/gx-hi STZ2
+    .tri/dx1 LDZ2 .tri/dd2 LDZ2 .tri/dx2 LDZ2 .tri/dd1 LDZ2 depth-gradient
+    .tri/gy-lo STZ2 .tri/gy-hi STZ2
+    &row
+        #7fff .tri/left STZ2 #8000 .tri/right STZ2
+        .tri/a LDZ2 .tri/b LDZ2 scan-edge
+        .tri/b LDZ2 .tri/c LDZ2 scan-edge
+        .tri/c LDZ2 .tri/a LDZ2 scan-edge
+        .tri/left LDZ2 #0000 math/smax16 .tri/left STZ2
+        .tri/right LDZ2 WIDTH math/smin16 .tri/right STZ2
+        .tri/left LDZ2 .tri/right LDZ2 math/slt16 ?&draw
+    &next
+        .tri/y LDZ2 INC2 DUP2 .tri/y STZ2 .tri/last LDZ2 LTH2 ?&row
+    &done JMP2r
+    &draw draw-span !&next
+
+@cross ( a** b** c** d** -- hi** lo** | signed widened a*b - c*d )
+    math/smul-wide16 STH2 STH2 math/smul-wide16 STH2r STH2r !int32/sub
+
+@depth-gradient ( a** b** c** d** -- hi** lo** | signed reciprocal-depth slope in Q6 )
+    cross #06 int32/lsh .tri/det-hi LDZ2 .tri/det-lo LDZ2 !int32/sdiv
+
+@scan-edge ( p** q** -- | updates bounds at the integer sample row )
+    ( Include the top endpoint, exclude the bottom. Ceil both X )
+    ( intersections. The span covers the left bound up to the right. )
+    OVR2 V-Y LDA2 OVR2 V-Y LDA2 math/sgt16 ?&swap
+    !&ordered
+    &swap SWP2
+    &ordered
+        .tri/q STZ2 .tri/p STZ2
+        .tri/p LDZ2 V-Y LDA2 DUP2 .tri/y1 STZ2 .tri/y LDZ2 math/sgt16 ?&done
+        .tri/q LDZ2 V-Y LDA2 DUP2 .tri/y LDZ2 math/sgt16 #00 EQU ?&skip
+        .tri/y1 LDZ2 SUB2 STH2
+        .tri/p LDZ2 LDA2 DUP2 .tri/x1 STZ2 .tri/q LDZ2 LDA2 SWP2 SUB2
+        .tri/y LDZ2 .tri/y1 LDZ2 SUB2
+        STH2r #01 ratio-offset .tri/x1 LDZ2 ADD2
+        DUP2 .tri/left LDZ2 math/smin16 .tri/left STZ2
+        .tri/right LDZ2 math/smax16 .tri/right STZ2 JMP2r
+    &skip POP2
+    &done JMP2r
+
+@draw-span ( -- | clips are already applied; interpolates inverse Z in screen space )
+    .tri/y LDZ2 #70 SFT2 COLOR-BUFFER ADD2
+    DUP2 .tri/left LDZ2 ADD2 .tri/pixel STZ2 .tri/right LDZ2 ADD2 .tri/stop STZ2
+    .tri/pixel LDZ2 COLOR-BUFFER SUB2 #10 SFT2 DEPTH-BUFFER ADD2 .tri/depth STZ2
+    .scene/shade LDZ #20 SFT .tri/y INC LDZ #01 AND #10 SFT ORA
+    U8 ;shade-pairs ADD2 LDA2 .tri/colors STZ2
+    .tri/a LDZ2 V-DEPTH LDA2 DUP2 #0a SFT2 SWP2 #60 SFT2
+    .tri/y LDZ2 .tri/a LDZ2 V-Y LDA2 SUB2 int32/sfrom16
+    .tri/gy-hi LDZ2 .tri/gy-lo LDZ2 int32/mul int32/add
+    .tri/left LDZ2 .tri/a LDZ2 LDA2 SUB2 int32/sfrom16
+    .tri/gx-hi LDZ2 .tri/gx-lo LDZ2 int32/mul int32/add
+    .tri/d-lo STZ2 .tri/d-hi STZ2
+    &pixel
+        .tri/d-hi LDZ2 DUP2 SIGN ?&negative
+        #a0 SFT2 .tri/d-lo LDZ2 #06 SFT2 ORA2
+        .tri/depth LDZ2 LDA2 GTH2k ?&write
+        POP2 POP2 !&next
+    &negative POP2
+    &next
+        .tri/pixel LDZ2 INC2 DUP2 .tri/pixel STZ2 .tri/stop LDZ2 EQU2 ?&done
+        .tri/depth LDZ2 NEXT2 .tri/depth STZ2
+        ( Low-word carry propagates into the signed high word. )
+        .tri/d-lo LDZ2 .tri/gx-lo LDZ2 ADD2k ROT2 LTH2k STH POP2 NIP2
+        .tri/d-lo STZ2
+        .tri/d-hi LDZ2 .tri/gx-hi LDZ2 ADD2 STHr U8 ADD2 .tri/d-hi STZ2
+        !&pixel
+    &write
+        POP2 .tri/depth LDZ2 STA2
+        .tri/pixel INC LDZ #01 AND .tri/colors ADD LDZ .tri/pixel LDZ2 STA
+        !&next
+    &done JMP2r
+
+@shade-pairs ( 2x2 ordered dither, rows of even/odd pixel colors )
+    0000 0000 0100 0000 0100 0001 0101 0001
+    0101 0101 0201 0101 0201 0102 0202 0102
+    0202 0202 0302 0202 0302 0203 0303 0203
+    0303 0303
+
+@present ( -- | packs one native 8x8 sprite at a time and presents the background )
+    #00 .screen/auto DEO
+    #0000 .blit/y STZ2 COLOR-BUFFER .blit/tile STZ2
+    &tiles-y
+        .blit/y LDZ2 .screen/y DEO2 #0000 .blit/x STZ2
+    &tiles-x
+        .blit/x LDZ2 .screen/x DEO2
+        .blit/tile LDZ2 pack-tile
+        ;fly-sprite .screen/addr DEO2 #81 .screen/sprite DEO
+        .blit/tile LDZ2 #0008 ADD2 .blit/tile STZ2
+        .blit/x LDZ2 #0008 ADD2 DUP2 .blit/x STZ2 WIDTH LTH2 ?&tiles-x
+        .blit/tile LDZ2 #0380 ADD2 .blit/tile STZ2
+        .blit/y LDZ2 #0008 ADD2 DUP2 .blit/y STZ2 HEIGHT LTH2 ?&tiles-y
+    JMP2r
+
+@pack-tile ( start** -- | packs eight rows into the two planes of fly-sprite )
+    .blit/row STZ2
+    ;fly-sprite .blit/ptr STZ2
+    ;fly-sprite #0008 ADD2 .blit/end STZ2
+    &row
+        #0000 .blit/lo STZ2
+        .blit/row LDZ2 #08 .blit/count STZ
+    &pixel ( address** )
+        LDAk DUP #01 AND .blit/lo LDZ #10 SFT ORA .blit/lo STZ
+        #01 SFT .blit/hi LDZ #10 SFT ORA .blit/hi STZ
+        INC2 .blit/count LDZ #01 SUB DUP .blit/count STZ ?&pixel
+        POP2
+        .blit/lo LDZ .blit/ptr LDZ2 STA
+        .blit/hi LDZ .blit/ptr LDZ2 #0008 ADD2 STA
+        .blit/row LDZ2 WIDTH ADD2 .blit/row STZ2
+        .blit/ptr LDZ2 INC2 DUP2 .blit/ptr STZ2 .blit/end LDZ2 LTH2 ?&row
+    JMP2r
+
+@draw-hud ( -- | clears and redraws the transparent foreground )
+    #0000 .screen/x DEO2 #0000 .screen/y DEO2 #c0 .screen/pixel DEO
+    #01 .screen/auto DEO
+    .flight/stats LDZ #00 EQU ?&overlays
+    #0004 .screen/y DEO2 #0004 .screen/x DEO2
+    #0a hud-glyph .flight/alt LDZ2 #04 SFT2 hud-number
+    #0032 .screen/x DEO2
+    #0b hud-glyph .flight/speed LDZ2 #000a MUL2 #04 SFT2 hud-number
+    #0060 .screen/x DEO2
+    #0c hud-glyph .flight/heading LDZ U8 #002d MUL2 #05 SFT2 hud-number
+    &overlays .fps/visible LDZ ?&fps
+    !&status
+    &fps draw-fps
+    &status
+        .flight/recovery LDZ ?&recovering
+        .flight/paused LDZ ?&paused
+        JMP2r
+    &recovering #0d !&icon
+    &paused #0e
+    &icon #0038 .screen/x DEO2 #0054 .screen/y DEO2 !hud-glyph
+
+@draw-fps ( -- | FPS and three digits at the lower right )
+    #0048 .screen/x DEO2 #0054 .screen/y DEO2
+    #0f hud-glyph #10 hud-glyph #0b hud-glyph
+    #0068 .screen/x DEO2
+    .flight/paused LDZ ?&paused
+    .fps/value LDZ DUP #ff EQU ?&waiting
+    U8 !hud-number
+    &waiting POP #11 hud-glyph #11 hud-glyph #11 !hud-glyph
+    &paused #0000 !hud-number
+
+@hud-number ( n** -- | prints three decimal digits with leading zeros )
+    #0064 DIV2k NIP hud-glyph DIV2k MUL2 SUB2
+    #000a DIV2k NIP hud-glyph DIV2k MUL2 SUB2 NIP !hud-glyph
+
+@hud-glyph ( index -- | foreground 1bpp, advances X by 8 )
+    U8 #30 SFT2 ;hud-font ADD2 .screen/addr DEO2
+    #43 .screen/sprite DEO JMP2r
+
+@hud-font
+    00 70 88 98 a8 c8 88 70 00 20 60 20 20 20 20 70 ( 0 1 )
+    00 70 88 08 10 20 40 f8 00 f0 08 08 70 08 08 f0 ( 2 3 )
+    00 10 30 50 90 f8 10 10 00 f8 80 80 f0 08 08 f0 ( 4 5 )
+    00 30 40 80 f0 88 88 70 00 f8 08 10 20 40 40 40 ( 6 7 )
+    00 70 88 88 70 88 88 70 00 70 88 88 78 08 10 60 ( 8 9 )
+    00 70 88 88 f8 88 88 88 00 78 88 80 70 08 88 f0 ( A S )
+    00 88 88 88 f8 88 88 88 00 10 38 38 54 7c 7c 00 ( H recovery )
+    00 6c 6c 6c 6c 6c 6c 00 ( pause )
+    00 f8 80 80 f0 80 80 80 ( F )
+    00 f0 88 88 f0 80 80 80 ( P )
+    00 00 00 00 70 00 00 00 ( dash )
+
+~lib/trig8.tal
+~lib/hash2d.tal
+~lib/math.tal
+~lib/int32.tal
+~lib/memory.tal
+
+@fly-code-end
+|4000 @fly-color $3000
+@fly-depth $6000
+@fly-heights $400
+@fly-terrain $2a30
+@fly-aircraft $c0
+@fly-intersect $18
+@fly-polygon $8
+@fly-sprite $10
+@fly-ram-end
+
+~lib/varvara.tal
